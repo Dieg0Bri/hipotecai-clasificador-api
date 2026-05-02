@@ -203,7 +203,32 @@ async def eventarc_receiver(request: Request):
             return success_response(message="needs OCR")
 
         result = classifier.classify(text)
-        logger.info("Eventarc clasificado %s → %s (%.2f)", name, result.tipo, result.confianza)
+        logger.info(
+            "Eventarc clasificado %s → %s (%.2f), triggers=%s",
+            name, result.tipo, result.confianza, result.triggers,
+        )
+
+        # Persistir clasificación en dt_archivos (si conocemos id_archivo)
+        # y solicitudes generadas por triggers en dt_documentos_solicitados.
+        # El path en GCS sigue el patrón <folio>/<filename>.
+        folio = name.split("/")[0] if "/" in name else None
+
+        # Re-evaluamos triggers para tener el detalle (codigos_solicitados, motivo)
+        # — el classifier solo guardó los IDs en result.triggers.
+        from src.services.triggers import evaluar_triggers
+        solicitudes = evaluar_triggers(text=text, tipo=result.tipo)
+
+        if db and folio and solicitudes:
+            try:
+                inserted = await db.save_documentos_solicitados(
+                    folio=folio,
+                    id_archivo_origen=None,  # ingestion-service tiene el id; aquí no
+                    solicitudes=solicitudes,
+                )
+                logger.info("Eventarc: %d solicitudes guardadas para folio=%s", inserted, folio)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("save_documentos_solicitados falló (no bloqueante)")
+
         # TODO v0+1: publicar a Pub/Sub para encadenar documentos-api
         return success_response(data=result.model_dump())
     except Exception as exc:  # noqa: BLE001

@@ -1,22 +1,18 @@
 """
 Modelos Pydantic compartidos por el clasificador-api.
 """
+from __future__ import annotations
+
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.models.catalogo import CODIGOS_VALIDOS
 
-# Códigos de los tipos de documento que el clasificador puede emitir.
-TipoDocumento = Literal[
-    "escritura",                # Escritura pública (compraventa, hipoteca, alzamiento)
-    "cert_dominio_vigente",     # Certificado de dominio vigente (CBR)
-    "cert_hipotecas_gravamenes",# Certificado de hipotecas y gravámenes (CBR)
-    "cert_avaluo_sii",          # Certificado de avalúo fiscal (SII)
-    "cert_municipal",           # Certificado municipal (número, no expropiación, recepción final)
-    "plano_propiedad",          # Plano de propiedad / loteo
-    "plan_regulador",           # Plan regulador comunal
-    "otro",                     # No clasificado
-]
+# El tipo se valida contra el catálogo en runtime via Pydantic.
+# Lo dejamos como str + validator (en vez de Literal[...]) para no
+# tener que duplicar la lista en dos lugares.
+TipoDocumento = str  # validar con CODIGOS_VALIDOS
 
 
 class ClasificarFromGCSRequest(BaseModel):
@@ -49,3 +45,11 @@ class ClasificacionResultado(BaseModel):
         description="Fragmentos del texto fuente que justifican la clasificación.",
     )
     requiere_revision: bool = False
+    triggers: list[str] = Field(
+        default_factory=list,
+        description="IDs de triggers IF/THEN que se gatillaron por contenido del documento.",
+    )
+
+
+# Re-exportar variantes literal para compatibilidad con código existente.
+SeveridadHallazgo = Literal["critica", "alta", "media", "baja", "info"]

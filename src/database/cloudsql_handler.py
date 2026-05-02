@@ -67,6 +67,64 @@ class CloudSQLHandler:
             await session.commit()
         return True
 
+    async def save_documentos_solicitados(
+        self,
+        folio: str,
+        id_archivo_origen: Optional[int],
+        solicitudes: list[dict],
+    ) -> int:
+        """
+        Persiste las solicitudes que generaron los triggers IF/THEN.
+        Una solicitud puede pedir múltiples códigos del catálogo (ej. T-CONDOMINIO
+        pide cert_deuda_gastos_comunes Y acta_asamblea_copropietarios).
+
+        Idempotente vía UNIQUE (id_estudio, trigger_id, id_clasificacion):
+        si ya existe, no duplica.
+
+        Returns: cantidad de filas efectivamente insertadas.
+        """
+        if not self.engine or not solicitudes:
+            return 0
+
+        sql = text(
+            """
+            INSERT INTO dt_documentos_solicitados (
+                id_estudio, id_clasificacion, trigger_id, motivo,
+                id_archivo_origen, matched_phrase, estado
+            )
+            SELECT
+                e.id_estudio,
+                c.id,
+                :trigger_id,
+                :motivo,
+                :id_archivo_origen,
+                :matched_phrase,
+                'pendiente'
+            FROM dt_estudio e, dt_clasificaciones c
+            WHERE e.folio = :folio AND c.codigo = :codigo
+            ON CONFLICT (id_estudio, trigger_id, id_clasificacion) DO NOTHING
+            """
+        )
+
+        inserted = 0
+        async with self.session_factory() as session:
+            for sol in solicitudes:
+                for codigo in sol.get("codigos_solicitados", []):
+                    res = await session.execute(
+                        sql,
+                        {
+                            "folio": folio,
+                            "codigo": codigo,
+                            "trigger_id": sol["trigger_id"],
+                            "motivo": sol["motivo"],
+                            "id_archivo_origen": id_archivo_origen,
+                            "matched_phrase": (sol.get("matched_phrase") or "")[:500],
+                        },
+                    )
+                    inserted += res.rowcount or 0
+            await session.commit()
+        return inserted
+
     async def close(self) -> None:
         if self.engine:
             await self.engine.dispose()
