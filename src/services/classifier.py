@@ -156,11 +156,13 @@ class ClassifierService:
     def __init__(self, api_key: str | None = None, model_id: str | None = None):
         self.api_key = api_key or settings.GEMINI_API_KEY
         self.model_id = model_id or settings.GEMINI_MODEL_ID
+        # Vertex AI usa ADC del SA, no requiere api_key.
+        self.use_vertex = settings.VERTEX_AI and bool(settings.GOOGLE_CLOUD_PROJECT)
 
     def classify(self, text: str) -> ClasificacionResultado:
         """Clasifica un texto usando langextract → Gemini, y evalúa triggers IF/THEN."""
-        if not self.api_key:
-            logger.warning("GEMINI_API_KEY no configurada. Devolviendo clasificación heurística.")
+        if not self.use_vertex and not self.api_key:
+            logger.warning("Sin VERTEX_AI ni GEMINI_API_KEY. Usando heurística.")
             base = self._fallback_heuristic(text)
         else:
             base = self._classify_via_langextract(text)
@@ -199,13 +201,24 @@ class ClassifierService:
         except ImportError:
             examples = examples_raw
 
+        if self.use_vertex:
+            extract_kwargs = {
+                "language_model_params": {
+                    "vertexai": True,
+                    "project": settings.GOOGLE_CLOUD_PROJECT,
+                    "location": settings.VERTEX_LOCATION,
+                },
+            }
+        else:
+            extract_kwargs = {"api_key": self.api_key}
+
         result = lx.extract(
             text_or_documents=text[:50_000],
             prompt_description=prompt,
             examples=examples,
             model_id=self.model_id,
-            api_key=self.api_key,
             temperature=settings.LANGEXTRACT_TEMPERATURE,
+            **extract_kwargs,
         )
 
         return self._parse_result(result)
