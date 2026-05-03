@@ -208,8 +208,25 @@ async def eventarc_receiver(request: Request):
             name, result.tipo, result.confianza, result.triggers,
         )
 
-        # Persistir clasificación en dt_archivos (si conocemos id_archivo)
-        # y solicitudes generadas por triggers en dt_documentos_solicitados.
+        # Persistir clasificación en dt_archivos (estado_procesamiento='clasificado',
+        # id_clasificacion, confianza). Buscamos el archivo por gcs_path porque
+        # Eventarc no nos da id_archivo.
+        id_archivo: int | None = None
+        if db:
+            try:
+                id_archivo = await db.update_archivo_clasificacion_by_gcs_path(
+                    gcs_path=name,
+                    codigo_clasificacion=result.tipo,
+                    confianza=float(result.confianza),
+                )
+                if id_archivo:
+                    logger.info("Eventarc: dt_archivos id=%s actualizado a 'clasificado'", id_archivo)
+                else:
+                    logger.warning("Eventarc: no se encontró dt_archivos con gcs_path=%s", name)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Eventarc: update_archivo_clasificacion_by_gcs_path falló")
+
+        # Persistir solicitudes generadas por triggers en dt_documentos_solicitados.
         # El path en GCS sigue el patrón <folio>/<filename>.
         folio = name.split("/")[0] if "/" in name else None
 
@@ -222,7 +239,7 @@ async def eventarc_receiver(request: Request):
             try:
                 inserted = await db.save_documentos_solicitados(
                     folio=folio,
-                    id_archivo_origen=None,  # ingestion-service tiene el id; aquí no
+                    id_archivo_origen=id_archivo,  # ahora sí lo tenemos
                     solicitudes=solicitudes,
                 )
                 logger.info("Eventarc: %d solicitudes guardadas para folio=%s", inserted, folio)

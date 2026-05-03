@@ -25,19 +25,24 @@ logger = logging.getLogger(__name__)
 def _build_prompt() -> str:
     lineas = [
         "Eres un asistente experto en derecho de propiedad raíz chileno.",
-        "Clasifica el siguiente documento en EXACTAMENTE una de estas categorías "
-        "(devuelve el `codigo` exacto, no el nombre largo):",
+        "Clasifica el documento extrayendo:",
+        "  - extraction_class: 'tipo_documento'",
+        "  - extraction_text: el FRAGMENTO LITERAL del documento que delata el tipo "
+        "(típicamente el título o el encabezado del organismo emisor — copialo exacto del texto).",
+        "  - attributes.codigo: el código exacto de una de estas categorías:",
         "",
     ]
     for t in CATALOGO:
         if t["codigo"] == "otro":
             continue
-        lineas.append(f"- {t['codigo']}: {t['pista']} (emisor: {t['emisor']})")
-    lineas.append("- otro: si no encaja en ninguna categoría anterior.")
+        lineas.append(f"      · {t['codigo']}: {t['pista']} (emisor: {t['emisor']})")
+    lineas.append("      · otro: si no encaja en ninguna categoría anterior.")
     lineas.extend([
         "",
-        "Devuelve la clasificación junto con fragmentos textuales del documento "
-        "que justifiquen tu decisión (autoridad emisora, encabezado, sellos, etc.).",
+        "  - attributes.confianza: número 0.0-1.0",
+        "  - attributes.razones: por qué elegiste ese código (1 oración)",
+        "",
+        "IMPORTANTE: extraction_text DEBE ser un substring exacto del documento, no el código.",
         "Si dudas entre dos categorías cercanas (ej. cert_matrimonio vs cert_union_civil), "
         "elige según el TÍTULO LITERAL del certificado.",
     ])
@@ -45,7 +50,12 @@ def _build_prompt() -> str:
 
 
 def _build_examples() -> list[dict[str, Any]]:
-    """Few-shot examples para langextract. Documentos cortos representativos."""
+    """Few-shot examples para langextract.
+
+    extraction_text DEBE ser un substring literal del `text` del example —
+    langextract lo alinea contra el documento original. El código del catálogo
+    va en `attributes.codigo`.
+    """
     return [
         {
             "text": (
@@ -55,11 +65,11 @@ def _build_examples() -> list[dict[str, Any]]:
             ),
             "extractions": [{
                 "extraction_class": "tipo_documento",
-                "extraction_text": "cert_avaluo_sii",
+                "extraction_text": "Certificado de Avalúo Fiscal",
                 "attributes": {
+                    "codigo": "cert_avaluo_sii",
                     "confianza": 0.97,
-                    "nombre_largo": "Certificado de avalúo fiscal",
-                    "razones": "Encabezado SII y campos de rol/avalúo característicos",
+                    "razones": "Encabezado SII y título 'Certificado de Avalúo Fiscal'",
                 },
             }],
         },
@@ -72,11 +82,11 @@ def _build_examples() -> list[dict[str, Any]]:
             ),
             "extractions": [{
                 "extraction_class": "tipo_documento",
-                "extraction_text": "cert_hipotecas_gravamenes",
+                "extraction_text": "Certificado de Hipotecas, Gravámenes, Prohibiciones e Interdicciones",
                 "attributes": {
+                    "codigo": "cert_hipotecas_gravamenes",
                     "confianza": 0.95,
-                    "nombre_largo": "Certificado de hipotecas y gravámenes",
-                    "razones": "Mención explícita del CBR y del título del certificado",
+                    "razones": "CBR + título completo del certificado de hipotecas y gravámenes",
                 },
             }],
         },
@@ -88,10 +98,10 @@ def _build_examples() -> list[dict[str, Any]]:
             ),
             "extractions": [{
                 "extraction_class": "tipo_documento",
-                "extraction_text": "escritura_compraventa",
+                "extraction_text": "ESCRITURA PÚBLICA DE COMPRAVENTA",
                 "attributes": {
+                    "codigo": "escritura_compraventa",
                     "confianza": 0.96,
-                    "nombre_largo": "Escritura pública de compraventa",
                     "razones": "Encabezado 'ESCRITURA PÚBLICA DE COMPRAVENTA' + comparecencia ante notario",
                 },
             }],
@@ -105,11 +115,11 @@ def _build_examples() -> list[dict[str, Any]]:
             ),
             "extractions": [{
                 "extraction_class": "tipo_documento",
-                "extraction_text": "cert_matrimonio",
+                "extraction_text": "CERTIFICADO DE MATRIMONIO",
                 "attributes": {
+                    "codigo": "cert_matrimonio",
                     "confianza": 0.97,
-                    "nombre_largo": "Certificado de matrimonio",
-                    "razones": "Encabezado del Registro Civil + título 'CERTIFICADO DE MATRIMONIO'",
+                    "razones": "Registro Civil + título 'CERTIFICADO DE MATRIMONIO'",
                 },
             }],
         },
@@ -122,11 +132,11 @@ def _build_examples() -> list[dict[str, Any]]:
             ),
             "extractions": [{
                 "extraction_class": "tipo_documento",
-                "extraction_text": "cert_deuda_contribuciones",
+                "extraction_text": "Certificado de Deuda de Contribuciones",
                 "attributes": {
+                    "codigo": "cert_deuda_contribuciones",
                     "confianza": 0.96,
-                    "nombre_largo": "Certificado de deuda de contribuciones",
-                    "razones": "Encabezado TGR + título y rol/comuna característicos",
+                    "razones": "TGR + título 'Certificado de Deuda de Contribuciones'",
                 },
             }],
         },
@@ -139,11 +149,11 @@ def _build_examples() -> list[dict[str, Any]]:
             ),
             "extractions": [{
                 "extraction_class": "tipo_documento",
-                "extraction_text": "cert_recepcion_final_dom",
+                "extraction_text": "CERTIFICADO DE RECEPCIÓN FINAL",
                 "attributes": {
+                    "codigo": "cert_recepcion_final_dom",
                     "confianza": 0.95,
-                    "nombre_largo": "Certificado de recepción final (DOM)",
-                    "razones": "Encabezado DOM + título 'RECEPCIÓN FINAL'",
+                    "razones": "DOM + título 'CERTIFICADO DE RECEPCIÓN FINAL'",
                 },
             }],
         },
@@ -242,10 +252,16 @@ class ClassifierService:
             ex_text = getattr(ex, "extraction_text", None) or (
                 ex.get("extraction_text") if isinstance(ex, dict) else None
             )
-            if ex_text in CODIGOS_VALIDOS:
+            attrs = getattr(ex, "attributes", {}) or (ex.get("attributes", {}) if isinstance(ex, dict) else {})
+
+            # El código del catálogo viene en attributes.codigo; si por algún motivo
+            # llegó en extraction_text (compat retro), lo aceptamos también.
+            codigo_attr = attrs.get("codigo") if attrs else None
+            if codigo_attr in CODIGOS_VALIDOS:
+                tipo = codigo_attr
+            elif ex_text in CODIGOS_VALIDOS:  # retro-compat
                 tipo = ex_text
 
-            attrs = getattr(ex, "attributes", {}) or (ex.get("attributes", {}) if isinstance(ex, dict) else {})
             if "confianza" in attrs:
                 try:
                     confianza = float(attrs["confianza"])

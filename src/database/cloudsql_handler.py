@@ -67,6 +67,33 @@ class CloudSQLHandler:
             await session.commit()
         return True
 
+    async def update_archivo_clasificacion_by_gcs_path(
+        self, gcs_path: str, codigo_clasificacion: str, confianza: float
+    ) -> Optional[int]:
+        """
+        Variante para el handler de Eventarc: el evento de GCS solo trae bucket+name,
+        no el id_archivo. Lo buscamos por gcs_path y actualizamos. Devuelve el
+        id_archivo actualizado o None si no se encontró match.
+        """
+        if not self.engine:
+            return None
+        sql = text(
+            """
+            UPDATE dt_archivos
+            SET id_clasificacion = (SELECT id FROM dt_clasificaciones WHERE codigo = :codigo),
+                clasificacion_confianza = :confianza,
+                estado_procesamiento = 'clasificado',
+                fecha_actualizacion = NOW()
+            WHERE gcs_path = :gcs_path AND eliminado = FALSE
+            RETURNING id_archivo
+            """
+        )
+        async with self.session_factory() as session:
+            res = await session.execute(sql, {"codigo": codigo_clasificacion, "confianza": confianza, "gcs_path": gcs_path})
+            row = res.first()
+            await session.commit()
+            return row[0] if row else None
+
     async def save_documentos_solicitados(
         self,
         folio: str,
