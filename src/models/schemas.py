@@ -33,7 +33,7 @@ class ClasificarTextoRequest(BaseModel):
 
 
 class ClasificacionResultado(BaseModel):
-    """Resultado de la clasificación: tipo + score + spans relevantes."""
+    """Resultado de la clasificación: tipo + score + spans + decisión OCR."""
     model_config = ConfigDict(extra="allow")
 
     tipo: TipoDocumento
@@ -48,6 +48,14 @@ class ClasificacionResultado(BaseModel):
     triggers: list[str] = Field(
         default_factory=list,
         description="IDs de triggers IF/THEN que se gatillaron por contenido del documento.",
+    )
+
+    # Decisión de OCR. El extractor consume EXACTAMENTE una fuente: PDF nativo
+    # si requiere_ocr=False, o el markdown del OCR si True.
+    requiere_ocr: bool = False
+    razon_ocr: str | None = Field(
+        default=None,
+        description="Por qué Gemini decidió que el documento necesita OCR.",
     )
 
 

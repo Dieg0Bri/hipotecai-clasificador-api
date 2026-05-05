@@ -48,5 +48,9 @@ class Settings:
         cast=lambda v: [s.strip() for s in v.split(",")],
     )
 
+    # Fallback OCR si el PDF no trae capa de texto (escaneado).
+    OCR_API_URL: str = config("OCR_API_URL", default="")
+    OCR_API_TIMEOUT_S: int = config("OCR_API_TIMEOUT_S", default=180, cast=int)
+
 
 settings = Settings()

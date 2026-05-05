@@ -22,7 +22,7 @@ from src.services.triggers import evaluar_triggers
 logger = logging.getLogger(__name__)
 
 
-def _build_prompt() -> str:
+def _build_prompt(page_stats: dict | None = None) -> str:
     lineas = [
         "Eres un asistente experto en derecho de propiedad raíz chileno.",
         "Clasifica el documento extrayendo:",
@@ -46,6 +46,30 @@ def _build_prompt() -> str:
         "Si dudas entre dos categorías cercanas (ej. cert_matrimonio vs cert_union_civil), "
         "elige según el TÍTULO LITERAL del certificado.",
     ])
+
+    # Decisión de OCR (también en el output del clasificador). Se incluye sólo
+    # cuando hay datos por página — modo /classify-text plano la omite.
+    if page_stats:
+        lineas.extend([
+            "",
+            "ADEMÁS, decide si el documento necesita OCR:",
+            "  - attributes.requiere_ocr: true | false",
+            "  - attributes.razon_ocr: 1 oración explicando por qué (ej. 'cuerpo escaneado "
+            "desde la página 2', 'documento puramente digital, no necesita OCR').",
+            "",
+            "Datos del extractor de texto nativo (pdfplumber):",
+            f"  · Total de páginas:           {page_stats['n_total']}",
+            f"  · Páginas con texto seleccionable: {page_stats['paginas_con_texto']}",
+            f"  · Páginas vacías o casi vacías:    {page_stats['paginas_vacias']}",
+            f"  · Caracteres alfanuméricos por página: {page_stats['chars_por_pagina']}",
+            "",
+            "Heurística para tu decisión (no rígida — usa criterio):",
+            "  - Si la mayoría de páginas vienen vacías y este es un documento de "
+            "varias páginas (ej. una escritura), TÍPICAMENTE es escaneado y necesita OCR.",
+            "  - Carátula notarial digital (página 1 con pocas líneas) + cuerpo "
+            "vacío de pdfplumber = ESCANEADO, requiere OCR.",
+            "  - Documento de 1 página con texto extraíble = NO necesita OCR.",
+        ])
     return "\n".join(lineas)
 
 
@@ -169,13 +193,40 @@ class ClassifierService:
         # Vertex AI usa ADC del SA, no requiere api_key.
         self.use_vertex = settings.VERTEX_AI and bool(settings.GOOGLE_CLOUD_PROJECT)
 
-    def classify(self, text: str) -> ClasificacionResultado:
-        """Clasifica un texto usando langextract → Gemini, y evalúa triggers IF/THEN."""
+    def classify(self, text: str, page_stats: dict | None = None) -> ClasificacionResultado:
+        """Clasifica un texto usando langextract → Gemini, y evalúa triggers IF/THEN.
+
+        Si `page_stats` viene poblado (caso de un PDF real con stats por
+        página), Gemini también decide si el documento necesita OCR. La
+        decisión queda en `result.requiere_ocr` + `result.razon_ocr`.
+        """
+        # Caso especial: 0 páginas con texto = escaneo puro. No vale la pena
+        # llamar a Gemini sin texto — saltamos directo a "necesita OCR" y la
+        # clasificación real se re-corre después con el texto OCR.
+        if page_stats and page_stats.get("n_con_texto", 0) == 0:
+            return ClasificacionResultado(
+                tipo="otro",
+                confianza=0.0,
+                nombre_largo="Pendiente de OCR",
+                razones=["Documento sin texto seleccionable — clasificación se hará tras OCR."],
+                spans_evidencia=[],
+                requiere_revision=True,
+                requiere_ocr=True,
+                razon_ocr=f"Las {page_stats['n_total']} páginas vienen sin texto extraíble (escaneo).",
+            )
+
         if not self.use_vertex and not self.api_key:
             logger.warning("Sin VERTEX_AI ni GEMINI_API_KEY. Usando heurística.")
             base = self._fallback_heuristic(text)
+            # Heurística simple para OCR sin Gemini: si más del 50% páginas vacías → OCR.
+            if page_stats and page_stats["n_vacias"] > page_stats["n_con_texto"]:
+                base.requiere_ocr = True
+                base.razon_ocr = (
+                    f"Heurística: {page_stats['n_vacias']}/{page_stats['n_total']} "
+                    "páginas vacías sugiere documento escaneado."
+                )
         else:
-            base = self._classify_via_langextract(text)
+            base = self._classify_via_langextract(text, page_stats=page_stats)
 
         # Evaluar triggers — independiente del clasificador. Esto detecta
         # condiciones como bien familiar, usufructo, condominio, etc.
@@ -183,13 +234,13 @@ class ClassifierService:
         base.triggers = [t["trigger_id"] for t in triggers_gatillados]
         return base
 
-    def _classify_via_langextract(self, text: str) -> ClasificacionResultado:
+    def _classify_via_langextract(self, text: str, page_stats: dict | None = None) -> ClasificacionResultado:
         try:
             import langextract as lx  # noqa: WPS433
         except ImportError as exc:
             raise RuntimeError("langextract no instalado. pip install langextract") from exc
 
-        prompt = _build_prompt()
+        prompt = _build_prompt(page_stats=page_stats)
         examples_raw = _build_examples()
 
         try:
@@ -241,6 +292,8 @@ class ClassifierService:
         confianza = 0.0
         razones: list[str] = []
         spans: list[dict] = []
+        requiere_ocr_attr: bool | None = None
+        razon_ocr_attr: str | None = None
 
         for ex in extractions:
             extraction_class = getattr(ex, "extraction_class", None) or (
@@ -270,6 +323,17 @@ class ClassifierService:
             if "razones" in attrs:
                 razones.append(str(attrs["razones"]))
 
+            # Decisión OCR (sólo presente cuando el prompt incluyó page_stats).
+            if "requiere_ocr" in attrs:
+                req_raw = attrs["requiere_ocr"]
+                if isinstance(req_raw, bool):
+                    requiere_ocr_attr = req_raw
+                else:
+                    requiere_ocr_attr = str(req_raw).lower() in ("true", "1", "sí", "si", "yes")
+            else:
+                requiere_ocr_attr = None
+            razon_ocr_attr = attrs.get("razon_ocr") if "razon_ocr" in attrs else None
+
             char_interval = getattr(ex, "char_interval", None)
             if char_interval:
                 spans.append({
@@ -288,6 +352,8 @@ class ClassifierService:
             razones=razones,
             spans_evidencia=spans,
             requiere_revision=confianza < 0.6 or tipo == "otro",
+            requiere_ocr=bool(requiere_ocr_attr) if requiere_ocr_attr is not None else False,
+            razon_ocr=str(razon_ocr_attr) if razon_ocr_attr else None,
         )
 
     def _fallback_heuristic(self, text: str) -> ClasificacionResultado:

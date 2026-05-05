@@ -68,20 +68,39 @@ class CloudSQLHandler:
         return True
 
     async def update_archivo_clasificacion_by_gcs_path(
-        self, gcs_path: str, codigo_clasificacion: str, confianza: float
+        self,
+        gcs_path: str,
+        codigo_clasificacion: str,
+        confianza: float,
+        *,
+        requiere_ocr: bool = False,
+        razon_ocr: str | None = None,
+        fuente_extraccion: str = "pdf_text",
+        estado_ocr: str = "no_aplica",
+        pages_stats: dict | None = None,
     ) -> Optional[int]:
         """
         Variante para el handler de Eventarc: el evento de GCS solo trae bucket+name,
         no el id_archivo. Lo buscamos por gcs_path y actualizamos. Devuelve el
         id_archivo actualizado o None si no se encontró match.
+
+        Persiste también la decisión OCR (#008): el clasificador es quien
+        decide si el documento necesita OCR; el extractor luego elige la
+        fuente correcta sin tener que re-evaluar.
         """
         if not self.engine:
             return None
+        import json
         sql = text(
             """
             UPDATE dt_archivos
             SET id_clasificacion = (SELECT id FROM dt_clasificaciones WHERE codigo = :codigo),
                 clasificacion_confianza = :confianza,
+                requiere_ocr = :requiere_ocr,
+                razon_ocr = :razon_ocr,
+                fuente_extraccion = :fuente_extraccion,
+                estado_ocr = :estado_ocr,
+                pages_stats = CAST(:pages_stats AS JSONB),
                 estado_procesamiento = 'clasificado',
                 fecha_actualizacion = NOW()
             WHERE gcs_path = :gcs_path AND eliminado = FALSE
@@ -89,10 +108,33 @@ class CloudSQLHandler:
             """
         )
         async with self.session_factory() as session:
-            res = await session.execute(sql, {"codigo": codigo_clasificacion, "confianza": confianza, "gcs_path": gcs_path})
+            res = await session.execute(sql, {
+                "codigo": codigo_clasificacion,
+                "confianza": confianza,
+                "requiere_ocr": requiere_ocr,
+                "razon_ocr": razon_ocr,
+                "fuente_extraccion": fuente_extraccion,
+                "estado_ocr": estado_ocr,
+                "pages_stats": json.dumps(pages_stats) if pages_stats else None,
+                "gcs_path": gcs_path,
+            })
             row = res.first()
             await session.commit()
             return row[0] if row else None
+
+    async def set_estado_ocr(self, id_archivo: int, estado: str) -> None:
+        """Cambia estado_ocr durante el ciclo del job (pendiente → procesando → listo/error)."""
+        if not self.engine:
+            return
+        async with self.session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE dt_archivos SET estado_ocr = :e, fecha_actualizacion = NOW() "
+                    "WHERE id_archivo = :id"
+                ),
+                {"e": estado, "id": id_archivo},
+            )
+            await session.commit()
 
     async def save_documentos_solicitados(
         self,
@@ -151,6 +193,78 @@ class CloudSQLHandler:
                     inserted += res.rowcount or 0
             await session.commit()
         return inserted
+
+    # ───── Idempotencia de pipeline (#6) ─────
+
+    async def pipeline_run_already_ok(
+        self, *, id_archivo: int, etapa: str, sha256_input: str, version: str
+    ) -> bool:
+        """True si esta etapa ya corrió OK para este (archivo, sha, versión)."""
+        if not self.engine:
+            return False
+        async with self.session_factory() as session:
+            res = await session.execute(
+                text(
+                    """
+                    SELECT 1 FROM dt_pipeline_run
+                    WHERE id_archivo = :id AND etapa = :etapa
+                      AND sha256_input = :sha AND version_pipeline = :version
+                      AND estado = 'ok'
+                    LIMIT 1
+                    """
+                ),
+                {"id": id_archivo, "etapa": etapa, "sha": sha256_input, "version": version},
+            )
+            return res.first() is not None
+
+    async def pipeline_run_record(
+        self,
+        *,
+        id_archivo: int,
+        etapa: str,
+        sha256_input: str,
+        version: str,
+        estado: str,
+        duracion_ms: int | None = None,
+        error_msg: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        if not self.engine:
+            return
+        async with self.session_factory() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO dt_pipeline_run (
+                        id_tenant, id_archivo, etapa, sha256_input, version_pipeline,
+                        estado, duracion_ms, error_msg, request_id, started_at, finished_at
+                    )
+                    SELECT a.id_tenant, :id, :etapa, :sha, :version,
+                           :estado, :dur, :err, :rid,
+                           NOW() - (COALESCE(:dur,0) * INTERVAL '1 millisecond'), NOW()
+                    FROM dt_archivos a WHERE a.id_archivo = :id
+                    ON CONFLICT (id_archivo, etapa, sha256_input, version_pipeline, estado)
+                    DO NOTHING
+                    """
+                ),
+                {
+                    "id": id_archivo, "etapa": etapa, "sha": sha256_input,
+                    "version": version, "estado": estado, "dur": duracion_ms,
+                    "err": (error_msg or "")[:1000] or None, "rid": request_id,
+                },
+            )
+            await session.commit()
+
+    async def find_archivo_by_gcs_path(self, gcs_path: str) -> int | None:
+        if not self.engine:
+            return None
+        async with self.session_factory() as session:
+            res = await session.execute(
+                text("SELECT id_archivo FROM dt_archivos WHERE gcs_path = :p AND eliminado = FALSE"),
+                {"p": gcs_path},
+            )
+            row = res.first()
+            return row[0] if row else None
 
     async def close(self) -> None:
         if self.engine:
