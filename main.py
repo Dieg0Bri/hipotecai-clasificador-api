@@ -274,10 +274,15 @@ async def eventarc_receiver(request: Request):
                     pass
             try:
                 import httpx
+                from src.services.service_auth import get_id_token
+                ocr_base = settings.OCR_API_URL.rstrip("/")
+                ocr_token = get_id_token(ocr_base)
+                headers = {"Authorization": f"Bearer {ocr_token}"} if ocr_token else {}
                 async with httpx.AsyncClient(timeout=settings.OCR_API_TIMEOUT_S) as client:
                     ocr_resp = await client.post(
-                        f"{settings.OCR_API_URL.rstrip('/')}/ocr-from-gcs",
+                        f"{ocr_base}/ocr-from-gcs",
                         json={"gcs_path": name, "id_archivo": archivo_id_pre},
+                        headers=headers,
                     )
                 if ocr_resp.is_success:
                     body = ocr_resp.json().get("data") or {}

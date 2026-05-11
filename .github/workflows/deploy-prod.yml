@@ -34,7 +34,8 @@ jobs:
           gcloud builds submit . \
             --config=cloudbuild-prod.yaml \
             --project=${{ secrets.GCP_PROJECT }} \
-            --substitutions=_GOOGLE_CLIENT_ID="${{ secrets.GOOGLE_CLIENT_ID }}",_OCR_API_URL="${{ steps.ocr.outputs.url }}"
+            --substitutions=_GOOGLE_CLIENT_ID="${{ secrets.GOOGLE_CLIENT_ID }}",_OCR_API_URL="${{ steps.ocr.outputs.url }}" \
+            --polling-interval=15
 
       - id: url
         run: |
